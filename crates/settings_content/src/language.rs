@@ -444,7 +444,7 @@ pub struct LanguageSettingsContent {
     /// - "off": Use tree-sitter queries to compute document symbols (default).
     /// - "on": Use the language server's `textDocument/documentSymbol` LSP response. When enabled, tree-sitter is not used for document symbols.
     ///
-    /// Default: "tree_sitter"
+    /// Default: "off"
     pub document_symbols: Option<DocumentSymbols>,
     /// Controls where the `editor::Rewrap` action is allowed for this language.
     ///

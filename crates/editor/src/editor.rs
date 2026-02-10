@@ -1348,8 +1348,10 @@ pub struct Editor {
     fetched_tree_sitter_chunks: HashMap<ExcerptId, HashSet<Range<BufferRow>>>,
     semantic_token_state: SemanticTokenState,
     pub(crate) refresh_matching_bracket_highlights_task: Task<()>,
-    refresh_outline_symbols_task: Task<()>,
-    outline_symbols: Option<(BufferId, Vec<OutlineItem<Anchor>>)>,
+    refresh_document_symbols_task: Task<()>,
+    lsp_document_symbols: HashMap<BufferId, Vec<OutlineItem<text::Anchor>>>,
+    refresh_outline_symbols_at_cursor_at_cursor_task: Task<()>,
+    outline_symbols_at_cursor: Option<(BufferId, Vec<OutlineItem<Anchor>>)>,
     sticky_headers_task: Task<()>,
     sticky_headers: Option<Vec<OutlineItem<Anchor>>>,
 }
@@ -2594,8 +2596,10 @@ impl Editor {
             fetched_tree_sitter_chunks: HashMap::default(),
             number_deleted_lines: false,
             refresh_matching_bracket_highlights_task: Task::ready(()),
-            refresh_outline_symbols_task: Task::ready(()),
-            outline_symbols: None,
+            refresh_document_symbols_task: Task::ready(()),
+            lsp_document_symbols: HashMap::default(),
+            refresh_outline_symbols_at_cursor_at_cursor_task: Task::ready(()),
+            outline_symbols_at_cursor: None,
             sticky_headers_task: Task::ready(()),
             sticky_headers: None,
         };
@@ -3598,7 +3602,7 @@ impl Editor {
 
             self.refresh_selected_text_highlights(false, window, cx);
             self.refresh_matching_bracket_highlights(window, cx);
-            self.refresh_outline_symbols(cx);
+            self.refresh_outline_symbols_at_cursor(cx);
             self.update_visible_edit_prediction(window, cx);
             self.edit_prediction_requires_modifier_in_indent_conflict = true;
             self.inline_blame_popover.take();
@@ -7596,24 +7600,17 @@ impl Editor {
     }
 
     #[ztracing::instrument(skip_all)]
-    fn refresh_outline_symbols(&mut self, cx: &mut Context<Editor>) {
+    fn refresh_outline_symbols_at_cursor(&mut self, cx: &mut Context<Editor>) {
         if !self.mode.is_full() {
             return;
         }
         let cursor = self.selections.newest_anchor().head();
         let multibuffer_snapshot = self.buffer().read(cx).snapshot(cx);
 
-        if let Some(lsp_task) =
-            self.lsp_document_symbols_for_cursor(cursor, &multibuffer_snapshot, cx)
-        {
-            self.refresh_outline_symbols_task = cx.spawn(async move |this, cx| {
-                let symbols = lsp_task.await;
-                this.update(cx, |this, cx| {
-                    this.outline_symbols = symbols;
-                    cx.notify();
-                })
-                .ok();
-            });
+        if self.uses_lsp_document_symbols(cursor, &multibuffer_snapshot, cx) {
+            self.outline_symbols_at_cursor =
+                self.lsp_symbols_at_cursor(cursor, &multibuffer_snapshot, cx);
+            cx.notify();
             return;
         }
 
@@ -7621,10 +7618,10 @@ impl Editor {
         let background_task = cx.background_spawn(async move {
             multibuffer_snapshot.symbols_containing(cursor, Some(&syntax))
         });
-        self.refresh_outline_symbols_task = cx.spawn(async move |this, cx| {
+        self.refresh_outline_symbols_at_cursor_at_cursor_task = cx.spawn(async move |this, cx| {
             let symbols = background_task.await;
             this.update(cx, |this, cx| {
-                this.outline_symbols = symbols;
+                this.outline_symbols_at_cursor = symbols;
                 cx.notify();
             })
             .ok();
@@ -23874,7 +23871,7 @@ impl Editor {
                 self.refresh_code_actions(window, cx);
                 self.refresh_single_line_folds(window, cx);
                 self.refresh_matching_bracket_highlights(window, cx);
-                self.refresh_outline_symbols(cx);
+                self.refresh_outline_symbols_at_cursor(cx);
                 self.refresh_sticky_headers(&self.snapshot(window, cx), cx);
                 if self.has_active_edit_prediction() {
                     self.update_visible_edit_prediction(window, cx);
@@ -25241,6 +25238,7 @@ impl Editor {
         }
         self.refresh_document_colors(for_buffer, window, cx);
         self.refresh_folding_ranges(for_buffer, window, cx);
+        self.refresh_document_symbols(for_buffer, window, cx);
     }
 
     fn register_visible_buffers(&mut self, cx: &mut Context<Self>) {
@@ -25323,10 +25321,11 @@ impl Editor {
             show_underlines: self.diagnostics_enabled(),
         }
     }
+
     fn breadcrumbs_inner(&self, cx: &App) -> Option<Vec<BreadcrumbText>> {
         let multibuffer = self.buffer().read(cx);
         let is_singleton = multibuffer.is_singleton();
-        let (buffer_id, symbols) = self.outline_symbols.as_ref()?;
+        let (buffer_id, symbols) = self.outline_symbols_at_cursor.as_ref()?;
         let buffer = multibuffer.buffer(*buffer_id)?;
 
         let buffer = buffer.read(cx);
@@ -26508,16 +26507,6 @@ pub trait SemanticsProvider {
         new_name: String,
         cx: &mut App,
     ) -> Option<Task<Result<ProjectTransaction>>>;
-
-    /// Returns document symbol outline items for the given buffer.
-    ///
-    /// Returns `Some(task)` when LSP document symbols are configured and available,
-    /// `None` when the caller should fall back to tree-sitter.
-    fn document_symbols(
-        &self,
-        buffer: &Entity<Buffer>,
-        cx: &mut App,
-    ) -> Option<Task<Vec<OutlineItem<text::Anchor>>>>;
 }
 
 pub trait CompletionProvider {
@@ -27119,29 +27108,6 @@ impl SemanticsProvider for Entity<Project> {
     ) -> Option<Task<Result<ProjectTransaction>>> {
         Some(self.update(cx, |project, cx| {
             project.perform_rename(buffer.clone(), position, new_name, cx)
-        }))
-    }
-
-    fn document_symbols(
-        &self,
-        buffer: &Entity<Buffer>,
-        cx: &mut App,
-    ) -> Option<Task<Vec<OutlineItem<text::Anchor>>>> {
-        let lsp_enabled = {
-            let buffer = buffer.read(cx);
-            language::language_settings::language_settings(
-                buffer.language().map(|l| l.name()),
-                buffer.file(),
-                cx,
-            )
-            .document_symbols
-            .lsp_enabled()
-        };
-        if !lsp_enabled {
-            return None;
-        }
-        Some(self.read(cx).lsp_store().update(cx, |lsp_store, cx| {
-            lsp_store.fetch_document_symbols(buffer, cx)
         }))
     }
 }

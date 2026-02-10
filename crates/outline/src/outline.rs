@@ -5,8 +5,8 @@ use std::{
 };
 
 use editor::scroll::ScrollOffset;
-use editor::{Anchor, AnchorRangeExt, Editor, scroll::Autoscroll};
-use editor::{ExcerptId, MultiBufferOffset, RowHighlightOptions, SelectionEffects};
+use editor::{Anchor, AnchorRangeExt, Editor, ExcerptId, scroll::Autoscroll};
+use editor::{MultiBufferOffset, RowHighlightOptions, SelectionEffects};
 use fuzzy::StringMatch;
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle,
@@ -53,68 +53,41 @@ pub fn toggle(
         return;
     }
 
-    if let Some(lsp_task) = lsp_outline_for_editor(&editor, cx) {
-        let editor = editor.clone();
-        window
-            .spawn(cx, async move |cx| {
-                let Some(outline) = lsp_task.await else {
-                    return;
-                };
-                cx.update(|window, cx| {
-                    workspace.update(cx, |workspace, cx| {
-                        workspace.toggle_modal(window, cx, |window, cx| {
-                            OutlineView::new(outline, editor, window, cx)
-                        });
-                    });
-                })
-                .ok();
-            })
-            .detach();
+    let Some(task) = outline_for_editor(&editor, cx) else {
         return;
-    }
-
-    if let Some(outline) = editor
-        .read(cx)
-        .buffer()
-        .read(cx)
-        .snapshot(cx)
-        .outline(Some(cx.theme().syntax()))
-    {
-        workspace.update(cx, |workspace, cx| {
-            workspace.toggle_modal(window, cx, |window, cx| {
-                OutlineView::new(outline, editor, window, cx)
-            });
-        });
-    }
+    };
+    let editor = editor.clone();
+    window
+        .spawn(cx, async move |cx| {
+            let items = task.await;
+            if items.is_empty() {
+                return;
+            }
+            cx.update(|window, cx| {
+                let outline = Outline::new(items);
+                workspace.update(cx, |workspace, cx| {
+                    workspace.toggle_modal(window, cx, |window, cx| {
+                        OutlineView::new(outline, editor, window, cx)
+                    });
+                });
+            })
+            .ok();
+        })
+        .detach();
 }
 
-fn lsp_outline_for_editor(
-    editor: &Entity<Editor>,
-    cx: &mut App,
-) -> Option<Task<Option<Outline<Anchor>>>> {
-    let provider = editor.read(cx).semantics_provider()?;
+fn outline_for_editor(editor: &Entity<Editor>, cx: &App) -> Option<Task<Vec<OutlineItem<Anchor>>>> {
     let multibuffer = editor.read(cx).buffer().read(cx).snapshot(cx);
     let (excerpt_id, _, buffer_snapshot) = multibuffer.as_singleton()?;
     let excerpt_id = *excerpt_id;
-    let buffer = editor
-        .read(cx)
-        .buffer()
-        .read(cx)
-        .buffer(buffer_snapshot.remote_id())?;
-    let task = provider.document_symbols(&buffer, cx)?;
+    let buffer_id = buffer_snapshot.remote_id();
+    let task = editor.read(cx).buffer_outline_items(buffer_id, cx);
 
-    Some(cx.background_spawn(async move {
-        let items = task.await;
-        if items.is_empty() {
-            None
-        } else {
-            Some(Outline::new(
-                items
-                    .into_iter()
-                    .map(|item| buffer_anchor_to_multibuffer(item, excerpt_id))
-                    .collect(),
-            ))
-        }
+    Some(cx.background_executor().spawn(async move {
+        task.await
+            .into_iter()
+            .map(|item| buffer_anchor_to_multibuffer(item, excerpt_id))
+            .collect()
     }))
 }
 

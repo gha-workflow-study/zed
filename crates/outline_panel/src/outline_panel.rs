@@ -23,7 +23,6 @@ use gpui::{
     uniform_list,
 };
 use itertools::Itertools;
-use language::language_settings::language_settings;
 use language::{Anchor, BufferId, BufferSnapshot, OffsetRangeExt, OutlineItem};
 use menu::{Cancel, SelectFirst, SelectLast, SelectNext, SelectPrevious};
 use std::{
@@ -772,34 +771,14 @@ impl OutlinePanel {
             let project_subscription =
                 cx.subscribe_in(&project, window, |outline_panel, _, event, window, cx| {
                     if matches!(event, project::Event::LanguageServerAdded(..)) {
-                        let has_lsp_outlines =
-                            outline_panel.excerpts.iter().any(|(buffer_id, _)| {
-                                outline_panel
-                                    .buffer_snapshot_for_id(*buffer_id, cx)
-                                    .is_some_and(|snapshot| {
-                                        language_settings(
-                                            snapshot.language().map(|l| l.name()),
-                                            snapshot.file(),
-                                            cx,
-                                        )
-                                        .document_symbols
-                                        .lsp_enabled()
-                                    })
-                            });
-                        if has_lsp_outlines {
-                            for excerpts in outline_panel.excerpts.values_mut() {
-                                for excerpt in excerpts.values_mut() {
-                                    excerpt.invalidate_outlines();
-                                }
+                        for excerpts in outline_panel.excerpts.values_mut() {
+                            for excerpt in excerpts.values_mut() {
+                                excerpt.invalidate_outlines();
                             }
-                            let update_cached_items = outline_panel.update_non_fs_items(window, cx);
-                            if update_cached_items {
-                                outline_panel.update_cached_entries(
-                                    Some(UPDATE_DEBOUNCE),
-                                    window,
-                                    cx,
-                                );
-                            }
+                        }
+                        let update_cached_items = outline_panel.update_non_fs_items(window, cx);
+                        if update_cached_items {
+                            outline_panel.update_cached_entries(Some(UPDATE_DEBOUNCE), window, cx);
                         }
                     }
                 });
@@ -3451,91 +3430,34 @@ impl OutlinePanel {
             return;
         }
 
-        let syntax_theme = cx.theme().syntax().clone();
         let first_update = Arc::new(AtomicBool::new(true));
-        for (buffer_id, (buffer_snapshot, excerpt_ranges)) in excerpt_fetch_ranges {
-            let use_lsp = language_settings(
-                buffer_snapshot.language().map(|l| l.name()),
-                buffer_snapshot.file(),
-                cx,
-            )
-            .document_symbols
-            .lsp_enabled();
+        for (buffer_id, (_buffer_snapshot, excerpt_ranges)) in excerpt_fetch_ranges {
+            let outline_task = self
+                .active_editor()
+                .map(|editor| editor.read(cx).buffer_outline_items(buffer_id, cx).shared());
 
-            let lsp_task = if use_lsp {
-                let buffer = self
-                    .active_editor()
-                    .and_then(|editor| editor.read(cx).buffer().read(cx).buffer(buffer_id));
-                buffer.map(|buffer| {
-                    self.project
-                        .update(cx, |project, cx| {
-                            project.lsp_store().update(cx, |lsp_store, cx| {
-                                lsp_store.fetch_document_symbols(&buffer, cx)
-                            })
-                        })
-                        .shared()
-                })
-            } else {
-                None
-            };
-
-            for (excerpt_id, excerpt_range) in excerpt_ranges {
-                let syntax_theme = syntax_theme.clone();
-                let buffer_snapshot = buffer_snapshot.clone();
+            for (excerpt_id, _excerpt_range) in excerpt_ranges {
                 let first_update = first_update.clone();
-                let lsp_task = lsp_task.clone();
+                let outline_task = outline_task.clone();
                 self.outline_fetch_tasks.insert(
                     (buffer_id, excerpt_id),
                     cx.spawn_in(window, async move |outline_panel, cx| {
-                        let buffer_language = buffer_snapshot.language().cloned();
-
-                        let fetched_outlines = if let Some(lsp_task) = lsp_task {
-                            let outlines = lsp_task.await;
-                            let outlines_with_children = outlines
-                                .windows(2)
-                                .filter_map(|window| {
-                                    let current = &window[0];
-                                    let next = &window[1];
-                                    if next.depth > current.depth {
-                                        Some((current.range.clone(), current.depth))
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect::<HashSet<_>>();
-                            (outlines, outlines_with_children)
-                        } else {
-                            cx.background_spawn(async move {
-                                let mut outlines = buffer_snapshot.outline_items_containing(
-                                    excerpt_range.context,
-                                    false,
-                                    Some(&syntax_theme),
-                                );
-                                outlines.retain(|outline| {
-                                    buffer_language.is_none()
-                                        || buffer_language.as_ref()
-                                            == buffer_snapshot.language_at(outline.range.start)
-                                });
-
-                                let outlines_with_children = outlines
-                                    .windows(2)
-                                    .filter_map(|window| {
-                                        let current = &window[0];
-                                        let next = &window[1];
-                                        if next.depth > current.depth {
-                                            Some((current.range.clone(), current.depth))
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect::<HashSet<_>>();
-
-                                (outlines, outlines_with_children)
-                            })
-                            .await
+                        let Some(outline_task) = outline_task else {
+                            return;
                         };
-
-                        let (fetched_outlines, outlines_with_children) = fetched_outlines;
+                        let outlines = outline_task.await;
+                        let outlines_with_children = outlines
+                            .windows(2)
+                            .filter_map(|window| {
+                                let current = &window[0];
+                                let next = &window[1];
+                                if next.depth > current.depth {
+                                    Some((current.range.clone(), current.depth))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<HashSet<_>>();
 
                         outline_panel
                             .update_in(cx, |outline_panel, window, cx| {
@@ -3555,7 +3477,7 @@ impl OutlinePanel {
                                     .or_default()
                                     .get_mut(&excerpt_id)
                                 {
-                                    excerpt.outlines = ExcerptOutlines::Outlines(fetched_outlines);
+                                    excerpt.outlines = ExcerptOutlines::Outlines(outlines);
 
                                     if let Some(default_depth) = pending_default_depth
                                         && let ExcerptOutlines::Outlines(outlines) =
