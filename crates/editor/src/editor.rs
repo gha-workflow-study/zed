@@ -2641,10 +2641,8 @@ impl Editor {
                                 .timer(Duration::from_millis(50))
                                 .await;
                             editor
-                                .update_in(cx, |editor, window, cx| {
+                                .update(cx, |editor, cx| {
                                     editor.register_visible_buffers(cx);
-                                    editor.refresh_colors_for_visible_range(None, window, cx);
-                                    editor.refresh_folding_ranges(None, window, cx);
                                     editor.refresh_inlay_hints(
                                         InlayHintRefreshReason::NewLinesShown,
                                         cx,
@@ -24216,7 +24214,7 @@ impl Editor {
                 if !inlay_splice.is_empty() {
                     self.splice_inlays(&inlay_splice.to_remove, inlay_splice.to_insert, cx);
                 }
-                self.refresh_colors_for_visible_range(None, window, cx);
+                self.refresh_document_colors(None, window, cx);
             }
 
             self.refresh_inlay_hints(
@@ -25241,7 +25239,7 @@ impl Editor {
         } else {
             self.refresh_semantic_token_highlights(cx);
         }
-        self.refresh_colors_for_visible_range(for_buffer, window, cx);
+        self.refresh_document_colors(for_buffer, window, cx);
         self.refresh_folding_ranges(for_buffer, window, cx);
     }
 
